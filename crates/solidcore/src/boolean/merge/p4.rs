@@ -1451,14 +1451,7 @@ pub fn manifold_boolean(
     operation: BooleanOperation,
     caller_lock: Option<&mut MarkLock>,
 ) -> Result<bool> {
-    // Not upstream (WR-259): the cone intersection tests parallel-cylinder lines at their
-    // middle for the whole Boolean, restored on every exit.
-    let previous = kernels.primary.cone_parallel_midpoint_test.replace(true);
-    let previous_other = kernels
-        .other
-        .as_deref()
-        .map(|k| k.cone_parallel_midpoint_test.replace(true));
-    let result = manifold_boolean_transformed(
+    manifold_boolean_transformed(
         kernels,
         primary,
         other,
@@ -1469,15 +1462,10 @@ pub fn manifold_boolean(
         manifold,
         operation,
         caller_lock,
-    );
-    kernels.primary.cone_parallel_midpoint_test.set(previous);
-    if let (Some(k), Some(previous)) = (kernels.other.as_deref(), previous_other) {
-        k.cone_parallel_midpoint_test.set(previous);
-    }
-    result
+    )
 }
 
-/// [`manifold_boolean`] after the flags are set.
+/// The body of [`manifold_boolean`].
 fn manifold_boolean_transformed(
     kernels: &mut BooleanKernels<'_>,
     primary: &mut Option<Brep>,
@@ -1664,6 +1652,37 @@ fn manifold_boolean_translated(
         }
         if !options.keep_other_brep {
             *primary = None;
+        }
+    }
+    // Not upstream (tangency-labs/solidcore#746; opt-in,
+    // `Kernel::fixes.remove_slit_loops_where_solids_touch`): a volumetric Boolean's result
+    // loses the zero-area inner loops a contact curve inside a face left, and the shells
+    // joined only through them are split (the fork's `RemoveSlitLoopsWhereSolidsTouch`
+    // before `rpResult = m_vTI.m_pBrep`). The destroyed edge uses notify on call-local
+    // records under their type code and arena index.
+    if kernels.primary.fixes.remove_slit_loops_where_solids_touch
+        && matches!(
+            operation,
+            BooleanOperation::Union | BooleanOperation::Intersection | BooleanOperation::Difference
+        )
+    {
+        if let Some(a) = primary.as_mut() {
+            let editing = a.editing_enabled();
+            a.set_editing_enabled(true);
+            let mut records = std::collections::BTreeMap::new();
+            let mut env = edge::NotifyEnv {
+                records: &mut records,
+                attributes: &mut *attributes,
+                context: None,
+                key_of: &crate::topology::loopuse::notify_ref,
+            };
+            let removed = crate::topology::brep::p3::remove_slit_loops_where_solids_touch(
+                &mut *kernels.primary,
+                a,
+                &mut env,
+            );
+            a.set_editing_enabled(editing);
+            removed?;
         }
     }
     finish_boolean(
